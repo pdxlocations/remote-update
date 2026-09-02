@@ -19,7 +19,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-for program in curl python3; do
+for program in curl python3 unzip find; do
     command -v "$program" >/dev/null || die "Missing required command: $program"
 done
 if command -v meshtastic >/dev/null 2>&1; then
@@ -51,6 +51,12 @@ if not m: m=re.search(r"\bv?([0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9A-Za-z]+)?)\b",s)
 if not m: raise SystemExit(1)
 print(m.group(1))
 ') || die "Could not extract firmware version from CLI output.\n$INFO"
+HW_MODEL=$(printf '%s\n' "$INFO" | python3 -c '
+import re,sys
+s=sys.stdin.read()
+m=re.search(r"hwModel[\"'"'"' :]+[\"'"'"']?([A-Za-z0-9_ -]+)",s,re.I)
+print(m.group(1).strip() if m else "")
+') || true
 printf 'Installed firmware: %s\nChecking GitHub releases...\n' "$INSTALLED"
 
 JSON=$(curl --fail --silent --show-error --location \
@@ -99,7 +105,67 @@ while :; do
             ;;
     esac
 done
-printf 'Selected %s %s. The firmware download starts now.\n' "$TARGET" "$VERSION"
-printf 'Do not disconnect power or serial during the update.\n'
-"${CLI[@]}" --port "$PORT" --flash --firmware-version "$VERSION"
-printf 'Flash command completed. Run this script again after the node reconnects to verify.\n'
+printf 'Selected %s %s. Choose the matching archive next; nothing has been downloaded yet.\n' "$TARGET" "$VERSION"
+ASSETS=$(printf '%s' "$JSON" | python3 -c '
+import json,sys
+version=sys.argv[1]
+for release in json.load(sys.stdin):
+    if release.get("tag_name", "").lstrip("v") != version:
+        continue
+    for asset in release.get("assets", []):
+        name=asset.get("name", "")
+        url=asset.get("browser_download_url", "")
+        if name.startswith("firmware-") and name.endswith(".zip"):
+            print(name+"\t"+url)
+    break
+' "$VERSION") || die 'Could not read the selected release assets.'
+[ -n "$ASSETS" ] || die "No firmware ZIP assets found for $VERSION."
+printf '\nFirmware archives for %s:\n' "$VERSION"
+mapfile -t ARCHIVES <<< "$ASSETS"
+for index in "${!ARCHIVES[@]}"; do
+    IFS=$'\t' read -r ARCHIVE_NAME ARCHIVE_URL <<< "${ARCHIVES[$index]}"
+    printf '  %d) %s\n' "$((index + 1))" "$ARCHIVE_NAME"
+done
+while :; do
+    read -r -p 'Select the archive for your device, or [n]o: ' ANSWER
+    case "${ANSWER,,}" in
+        n|no|'') printf 'No firmware was downloaded.\n'; exit 0 ;;
+        *[!0-9]*) printf 'Enter a listed number or n.\n' >&2 ;;
+        *)
+            INDEX=$((ANSWER - 1))
+            if [ "$INDEX" -ge 0 ] && [ "$INDEX" -lt "${#ARCHIVES[@]}" ]; then IFS=$'\t' read -r ARCHIVE_NAME ARCHIVE_URL <<< "${ARCHIVES[$INDEX]}"; break; fi
+            printf 'Enter a listed number or n.\n' >&2 ;;
+    esac
+done
+WORKDIR=$(mktemp -d) || die 'Could not create a temporary working directory.'
+trap 'rm -rf "$WORKDIR"' EXIT
+ZIP_FILE="$WORKDIR/$ARCHIVE_NAME"
+printf 'Downloading %s...\n' "$ARCHIVE_NAME"
+curl --fail --show-error --location --output "$ZIP_FILE" "$ARCHIVE_URL" || die 'Firmware download failed.'
+unzip -q "$ZIP_FILE" -d "$WORKDIR/unpacked" || die 'Could not unpack firmware archive.'
+UPDATE_SCRIPT=$(find "$WORKDIR/unpacked" -type f -name device-update.sh -print -quit)
+[ -n "$UPDATE_SCRIPT" ] || die 'The archive does not contain device-update.sh.'
+chmod +x "$UPDATE_SCRIPT"
+MODEL_TOKEN=$(printf '%s' "$HW_MODEL" | tr '[:upper:]_' '[:lower:]-' | tr -cs '[:alnum:]-' '-')
+mapfile -t BINARIES < <(find "$WORKDIR/unpacked" -type f -name '*-update.bin' | sort)
+if [ -n "$MODEL_TOKEN" ]; then
+    mapfile -t MATCHING_BINARIES < <(printf '%s\n' "${BINARIES[@]}" | grep -i "firmware-${MODEL_TOKEN}-" || true)
+    [ "${#MATCHING_BINARIES[@]}" -gt 0 ] && BINARIES=("${MATCHING_BINARIES[@]}")
+fi
+[ "${#BINARIES[@]}" -gt 0 ] || die 'No update firmware binary was found in the selected archive.'
+printf '\nUpdate binaries%s:\n' "${HW_MODEL:+ (filtered for $HW_MODEL)}"
+for index in "${!BINARIES[@]}"; do printf '  %d) %s\n' "$((index + 1))" "$(basename "${BINARIES[$index]}")"; done
+while :; do
+    read -r -p 'Select the matching update binary, or [n]o: ' ANSWER
+    case "${ANSWER,,}" in
+        n|no|'') printf 'Download kept only temporarily; no update started.\n'; exit 0 ;;
+        *[!0-9]*) printf 'Enter a listed number or n.\n' >&2 ;;
+        *)
+            INDEX=$((ANSWER - 1))
+            if [ "$INDEX" -ge 0 ] && [ "$INDEX" -lt "${#BINARIES[@]}" ]; then FIRMWARE=${BINARIES[$INDEX]}; break; fi
+            printf 'Enter a listed number or n.\n' >&2 ;;
+    esac
+done
+printf 'Running device-update.sh with %s. Do not disconnect power or serial.\n' "$(basename "$FIRMWARE")"
+"$UPDATE_SCRIPT" -p "$PORT" -f "$FIRMWARE"
+printf 'Update completed. Run this script again after the node reconnects to verify.\n'

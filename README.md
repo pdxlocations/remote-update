@@ -8,6 +8,8 @@ Install the CLI once (along with `curl` and `python3`):
 python3 -m pip install --user 'meshtastic[cli]'
 ```
 
+No separate `unzip` package is needed; the script extracts the selected firmware archive using Python.
+
 Then copy the script to the Luckfox and run:
 
 ```sh

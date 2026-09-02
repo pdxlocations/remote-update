@@ -19,7 +19,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-for program in curl python3 unzip find; do
+for program in curl python3 find; do
     command -v "$program" >/dev/null || die "Missing required command: $program"
 done
 if command -v meshtastic >/dev/null 2>&1; then
@@ -142,7 +142,13 @@ trap 'rm -rf "$WORKDIR"' EXIT
 ZIP_FILE="$WORKDIR/$ARCHIVE_NAME"
 printf 'Downloading %s...\n' "$ARCHIVE_NAME"
 curl --fail --show-error --location --output "$ZIP_FILE" "$ARCHIVE_URL" || die 'Firmware download failed.'
-unzip -q "$ZIP_FILE" -d "$WORKDIR/unpacked" || die 'Could not unpack firmware archive.'
+python3 - "$ZIP_FILE" "$WORKDIR/unpacked" <<'PY' || die 'Could not unpack firmware archive.'
+import sys
+import zipfile
+
+with zipfile.ZipFile(sys.argv[1]) as archive:
+    archive.extractall(sys.argv[2])
+PY
 UPDATE_SCRIPT=$(find "$WORKDIR/unpacked" -type f -name device-update.sh -print -quit)
 [ -n "$UPDATE_SCRIPT" ] || die 'The archive does not contain device-update.sh.'
 chmod +x "$UPDATE_SCRIPT"
